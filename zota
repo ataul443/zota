@@ -1,0 +1,572 @@
+#!/bin/sh
+
+VERSION="0.1.0"
+ZOTA_DIR=".zota"
+ZOTA_HOME="$HOME/.zota"
+REGISTRY_FILE="$ZOTA_HOME/projects.registry"
+VERSION_FILE="$ZOTA_HOME/version.info"
+GITHUB_REPO="ataul443/zota"
+
+show_help() {
+    echo "zota - AI-powered spec-driven development assistant"
+    echo ""
+    echo "Usage:"
+    echo "  zota init              Initialize zota in the current directory"
+    echo "  zota new <name>        Create a new project with zota"
+    echo "  zota update [commit]   Update zota to latest or specific commit"
+    echo "  zota update-projects   Update zota in all registered projects"
+    echo "  zota list              List all registered projects"
+    echo "  zota --help            Show this help message"
+    echo "  zota --version         Show version"
+    echo ""
+}
+
+# Function to check prerequisites
+check_prerequisites() {
+    missing_deps=""
+    
+    # Check for jq
+    if ! command -v jq >/dev/null 2>&1; then
+        missing_deps="jq"
+    fi
+    
+    if [ -n "$missing_deps" ]; then
+        echo "Error: Missing required dependencies: $missing_deps" >&2
+        echo "" >&2
+        echo "Please install the missing dependencies:" >&2
+        echo "" >&2
+        
+        # Provide installation instructions based on platform
+        if [ "$(uname)" = "Darwin" ]; then
+            echo "  On macOS with Homebrew:" >&2
+            echo "    brew install jq" >&2
+        elif [ -f /etc/debian_version ]; then
+            echo "  On Debian/Ubuntu:" >&2
+            echo "    sudo apt-get install jq" >&2
+        elif [ -f /etc/redhat-release ]; then
+            echo "  On RHEL/CentOS/Fedora:" >&2
+            echo "    sudo yum install jq  # or dnf on newer versions" >&2
+        else
+            echo "  Please install jq using your system's package manager" >&2
+        fi
+        echo "" >&2
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to get current version info
+get_version_info() {
+    if [ -f "$VERSION_FILE" ]; then
+        cat "$VERSION_FILE"
+    else
+        echo "Version: $VERSION"
+        echo "Commit: unknown"
+        echo "Date: unknown"
+    fi
+}
+
+# Function to get zota version for config
+get_zota_version_yaml() {
+    version="$VERSION"
+    commit="unknown"
+    date="unknown"
+    ref="unknown"
+    
+    if [ -f "$VERSION_FILE" ]; then
+        version=$(grep "Version:" "$VERSION_FILE" | cut -d' ' -f2)
+        commit=$(grep "Commit:" "$VERSION_FILE" | cut -d' ' -f2)
+        date=$(grep "Date:" "$VERSION_FILE" | cut -d' ' -f2)
+        ref=$(grep "Ref:" "$VERSION_FILE" | cut -d' ' -f2)
+    fi
+    
+    cat << EOF
+zota:
+  version: $version
+  commit: $commit
+  installed: $date
+  ref: $ref
+EOF
+}
+
+# Function to update settings.local.json with required allow entries
+update_settings_json() {
+    settings_file="$1"
+    required_entries='["Bash(.claude/zota/scripts/metadata.sh:*)", "Bash(mkdir -p context:*)"]'
+    
+    if [ ! -f "$settings_file" ]; then
+        # If no settings file exists, create one with required entries
+        echo '{
+  "permissions": {
+    "allow": [  
+      "Bash(.claude/zota/scripts/metadata.sh:*)",
+      "Bash(mkdir -p context:*)"
+    ]
+  }
+}' > "$settings_file"
+    else
+        # Check if jq is available
+        if command -v jq >/dev/null 2>&1; then
+            # Use jq to update the file
+            temp_file=$(mktemp)
+            
+            # Ensure permissions.allow exists and add missing entries
+            jq --argjson entries "$required_entries" '
+                # Ensure permissions object exists
+                .permissions = (.permissions // {}) |
+                # Ensure allow array exists
+                .permissions.allow = (.permissions.allow // []) |
+                # Add missing entries
+                .permissions.allow = (.permissions.allow + ($entries - .permissions.allow) | unique)
+            ' "$settings_file" > "$temp_file"
+            
+            # Replace the original file if jq succeeded
+            if [ $? -eq 0 ]; then
+                mv "$temp_file" "$settings_file"
+            else
+                rm -f "$temp_file"
+                echo "Warning: Failed to update settings.local.json"
+            fi
+        else
+            # Fallback: Check if entries exist
+            has_metadata=$(grep '"Bash(.claude/zota/scripts/metadata.sh:\*)"' "$settings_file" 2>/dev/null | wc -l | tr -d ' ')
+            has_mkdir=$(grep '"Bash(mkdir -p context:\*)"' "$settings_file" 2>/dev/null | wc -l | tr -d ' ')
+            
+            if [ "$has_metadata" = "0" ] || [ "$has_mkdir" = "0" ]; then
+                echo "Warning: jq not found. Please manually add these entries to $settings_file:"
+                echo '  "Bash(.claude/zota/scripts/metadata.sh:*)"'
+                echo '  "Bash(mkdir -p context:*)"'
+            fi
+        fi
+    fi
+}
+
+# Function to update zota itself from GitHub
+update_zota() {
+    target_ref=${1:-main}
+    
+    echo "Updating zota from GitHub (ref: $target_ref)..."
+    echo ""
+    
+    # Create temp directory
+    temp_dir=$(mktemp -d)
+    trap "rm -rf $temp_dir" EXIT
+    
+    # Clone from GitHub
+    echo "Cloning zota from GitHub..."
+    source_dir="$temp_dir/zota"
+    if ! git clone --tags "git@github.com:$GITHUB_REPO.git" "$source_dir" 2>/dev/null; then
+        echo "Error: Failed to clone from GitHub. Check SSH access and if ref '$target_ref' exists." >&2
+        exit 1
+    fi
+    
+    # Checkout the specific ref if not main
+    if [ "$target_ref" != "main" ]; then
+        cd "$source_dir"
+        if ! git checkout "$target_ref" 2>/dev/null; then
+            echo "Error: Failed to checkout ref '$target_ref'" >&2
+            exit 1
+        fi
+        cd - >/dev/null
+    fi
+    
+    # Backup current installation
+    echo "Backing up current installation..."
+    if [ -d "$zota_HOME.backup" ]; then
+        rm -rf "$zota_HOME.backup"
+    fi
+    cp -r "$zota_HOME" "$zota_HOME.backup"
+    
+    # Update zota executable
+    echo "Updating zota executable..."
+    cp "$source_dir/zota" "$zota_HOME/zota"
+    
+    # Get the release version and commit info from git
+    release_version=""
+    commit_sha=""
+    if [ -d "$source_dir/.git" ]; then
+        # Do all git operations in a single directory change
+        cd "$source_dir"
+        
+        # Get commit info first
+        commit_sha=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+        
+        # If target_ref looks like a commit ID (not a version tag), use the commit as version
+        if echo "$target_ref" | grep -qE '^[a-f0-9]{7,}$'; then
+            # It's a commit ID, use it as version
+            release_version="$target_ref"
+            echo "Detected commit ID, using as version: $release_version"
+        else
+            # It's a tag or branch, get version from git tags
+            if [ "$target_ref" != "main" ]; then
+                # Remove 'v' prefix if it's a version tag
+                release_version=$(echo "$target_ref" | sed 's/^v//')
+            else
+                # For main branch, get latest tag
+                release_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo "0.1.0")
+            fi
+        fi
+        
+        cd - >/dev/null
+    else
+        release_version="0.1.0"
+        commit_sha="unknown"
+    fi
+    
+    # Update version in the script
+    sed -i.bak "s/VERSION=\"0.1.0\"/VERSION=\"$release_version\"/" "$zota_HOME/zota"
+    rm -f "$zota_HOME/zota.bak"
+    
+    chmod +x "$zota_HOME/zota"
+    
+    # Update resources
+    echo "Updating resources..."
+    [ -f "$source_dir/zota.md" ] && cp "$source_dir/zota.md" "$zota_HOME/"
+    [ -d "$source_dir/agents" ] && cp -r "$source_dir/agents" "$ZOTA_HOME/"
+    [ -d "$source_dir/commands" ] && cp -r "$source_dir/commands" "$ZOTA_HOME/"
+    [ -d "$source_dir/scripts" ] && cp -r "$source_dir/scripts" "$ZOTA_HOME/"
+    
+    # Update version file
+    cat > "$VERSION_FILE" << EOF
+Version: $release_version
+Commit: ${commit_sha:-unknown}
+Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+Ref: $target_ref
+EOF
+    
+    echo ""
+    echo "✓ zota updated successfully!"
+    echo ""
+    get_version_info
+    echo ""
+    echo "Now run 'zota update-projects' to update all registered projects."
+}
+
+# Function to register a project
+register_project() {
+    project_path="$1"
+    project_name="$2"
+    
+    # Ensure registry file exists
+    touch "$REGISTRY_FILE"
+    
+    # Check if project already registered
+    if ! grep -q "^$project_path|" "$REGISTRY_FILE" 2>/dev/null; then
+        echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ")|$project_path|$project_name" >> "$REGISTRY_FILE"
+    fi
+}
+
+# Function to list all projects
+list_projects() {
+    if [ ! -f "$REGISTRY_FILE" ] || [ ! -s "$REGISTRY_FILE" ]; then
+        echo "No projects registered yet."
+        return
+    fi
+    
+    echo "Registered zota projects:"
+    echo ""
+    while IFS='|' read -r date path name; do
+        if [ -d "$path" ]; then
+            echo "  • $name"
+            echo "    Path: $path"
+            echo "    Registered: $date"
+            echo ""
+        fi
+    done < "$REGISTRY_FILE"
+}
+
+# Function to update all registered projects with local zota
+update_projects() {
+    if [ ! -f "$REGISTRY_FILE" ] || [ ! -s "$REGISTRY_FILE" ]; then
+        echo "No projects to update."
+        return
+    fi
+    
+    echo "Updating zota in all registered projects..."
+    echo ""
+    
+    while IFS='|' read -r date path name; do
+        if [ -d "$path" ] && [ -d "$path/.zota" ]; then
+            echo "Updating: $name ($path)"
+            
+            # Update zota.md
+            if [ -f "$zota_HOME/zota.md" ]; then
+                mkdir -p "$path/.claude/commands"
+                cp "$zota_HOME/zota.md" "$path/.claude/commands/zota.md"
+                echo "  ✓ Updated zota.md"
+            fi
+            
+            # Update agents
+            if [ -d "$zota_HOME/agents" ]; then
+                mkdir -p "$path/.claude/agents"
+                cp -r "$zota_HOME/agents/"* "$path/.claude/agents/" 2>/dev/null || true
+                echo "  ✓ Updated agents"
+            fi
+            
+            # Update commands
+            if [ -d "$zota_HOME/commands" ]; then
+                mkdir -p "$path/.claude/zota/instructions"
+                cp -r "$zota_HOME/commands/"* "$path/.claude/zota/instructions/" 2>/dev/null || true
+                echo "  ✓ Updated commands"
+            fi
+            
+            # Update scripts
+            if [ -d "$zota_HOME/scripts" ]; then
+                mkdir -p "$path/.claude/zota/scripts"
+                cp -r "$zota_HOME/scripts/"* "$path/.claude/zota/scripts/" 2>/dev/null || true
+                echo "  ✓ Updated scripts"
+            fi
+            
+            # Update settings.local.json
+            if [ -d "$path/.claude" ]; then
+                update_settings_json "$path/.claude/settings.local.json"
+                echo "  ✓ Updated settings.local.json"
+            fi
+            
+            echo ""
+        fi
+    done < "$REGISTRY_FILE"
+    
+    echo "Update complete!"
+}
+
+init_project() {
+    if [ -d "$zota_DIR" ]; then
+        echo "Error: zota is already initialized in this directory" >&2
+        exit 1
+    fi
+    
+    # Check prerequisites before proceeding
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    echo "Initializing zota in current directory..."
+    
+    # Get the source directory (where zota is installed)
+    SOURCE_DIR="$HOME/.zota"
+    
+    # Create .zota directory structure
+    mkdir -p "$zota_DIR"
+    
+    # Create context directories in project root
+    mkdir -p "context/plans"
+    mkdir -p "context/local/tickets"
+    mkdir -p "context/local/research"
+    mkdir -p "context/local/plans"
+
+    
+    # Copy commands folder to .claude/zota/instructions if it exists in source
+    if [ -d "$SOURCE_DIR/commands" ]; then
+        mkdir -p ".claude/zota/instructions"
+        cp -r "$SOURCE_DIR/commands/"* ".claude/zota/instructions/" 2>/dev/null || true
+        echo "  - Copied commands to .claude/zota/instructions/"
+    fi
+    
+    # Copy scripts folder to .claude/zota/scripts if it exists in source
+    if [ -d "$SOURCE_DIR/scripts" ]; then
+        mkdir -p ".claude/zota/scripts"
+        cp -r "$SOURCE_DIR/scripts/"* ".claude/zota/scripts/" 2>/dev/null || true
+        echo "  - Copied scripts to .claude/zota/scripts/"
+    fi
+    
+    # Create .claude directories and copy resources
+    mkdir -p ".claude/zota/instructions"
+    mkdir -p ".claude/commands"
+    mkdir -p ".claude/agents"
+    mkdir -p ".claude/zota/scripts"
+    
+    if [ -f "$SOURCE_DIR/zota.md" ]; then
+        cp "$SOURCE_DIR/zota.md" ".claude/commands/zota.md"
+        echo "  - Copied zota.md to .claude/commands/"
+    fi
+    
+    # Copy agents folder if it exists in source
+    if [ -d "$SOURCE_DIR/agents" ]; then
+        cp -r "$SOURCE_DIR/agents/"* ".claude/agents/" 2>/dev/null || true
+        echo "  - Copied agents to .claude/agents/"
+    fi
+    
+    # Handle settings.local.json
+    update_settings_json ".claude/settings.local.json"
+    echo "  - Updated settings.local.json in .claude/"
+    
+    # Create default configuration files
+    cat > "$zota_DIR/config.yaml" << EOF
+# zota configuration
+version: 0.1.0
+project:
+  name: $(basename "$PWD")
+  type: generic
+  created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+$(get_zota_version_yaml)
+EOF
+    
+    # Register this project
+    register_project "$(pwd)" "$(basename "$PWD")"
+    
+    echo " zota initialized successfully in $(pwd)"
+    echo ""
+    echo "Created:"
+    echo "  - .zota/"
+    echo "  - .claude/commands/zota.md"
+    echo "  - .claude/agents/"
+}
+
+new_project() {
+    project_name="$1"
+    
+    if [ -z "$project_name" ]; then
+        echo "Error: Project name is required" >&2
+        echo "Usage: zota new <project-name>"
+        exit 1
+    fi
+    
+    if [ -d "$project_name" ]; then
+        echo "Error: Directory '$project_name' already exists" >&2
+        exit 1
+    fi
+    
+    # Check prerequisites before proceeding
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    echo "Creating new project: $project_name"
+    
+    # Create project directory
+    mkdir -p "$project_name"
+    cd "$project_name"
+    
+    # Get the source directory (where zota is installed)
+    SOURCE_DIR="$HOME/.zota"
+    
+    # Initialize zota in the new project
+    mkdir -p "$zota_DIR"
+    
+    # Create context directories in project root
+    mkdir -p "context/plans"
+    mkdir -p "context/local/tickets"
+    mkdir -p "context/local/research"
+    mkdir -p "context/local/plans"
+    
+    # Copy commands folder to .claude/zota/instructions if it exists in source
+    if [ -d "$SOURCE_DIR/commands" ]; then
+        mkdir -p ".claude/zota/instructions"
+        cp -r "$SOURCE_DIR/commands/"* ".claude/zota/instructions/" 2>/dev/null || true
+    fi
+    
+    # Copy scripts folder to .claude/zota/scripts if it exists in source
+    if [ -d "$SOURCE_DIR/scripts" ]; then
+        mkdir -p ".claude/zota/scripts"
+        cp -r "$SOURCE_DIR/scripts/"* ".claude/zota/scripts/" 2>/dev/null || true
+    fi
+    
+    # Create .claude directories and copy resources
+    mkdir -p ".claude/zota/instructions"
+    mkdir -p ".claude/commands"
+    mkdir -p ".claude/agents"
+    mkdir -p ".claude/zota/scripts"
+    
+    if [ -f "$SOURCE_DIR/zota.md" ]; then
+        cp "$SOURCE_DIR/zota.md" ".claude/commands/zota.md"
+    fi
+    
+    # Copy agents folder if it exists in source
+    if [ -d "$SOURCE_DIR/agents" ]; then
+        cp -r "$SOURCE_DIR/agents/"* ".claude/agents/" 2>/dev/null || true
+    fi
+    
+    # Handle settings.local.json
+    update_settings_json ".claude/settings.local.json"
+    
+    # Create project configuration
+    cat > "$zota_DIR/config.yaml" << EOF
+# zota configuration
+version: 0.1.0
+project:
+  name: $project_name
+  type: generic
+  created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+$(get_zota_version_yaml)
+
+# AI Assistant settings
+assistant:
+  model: default
+  temperature: 0.7
+EOF
+    
+    # Create project README
+    cat > "README.md" << EOF
+# $project_name
+
+Created with zota.
+
+## Getting Started
+
+This project was initialized with zota AI assistant support.
+
+## Project Structure
+
+- \`.zota/\` - AI assistant configuration
+- \`README.md\` - This file
+
+## Usage
+
+Use \`zota\` commands to interact with the AI assistant.
+EOF
+    
+    # Register this project (using current directory since we cd'd into it)
+    register_project "$(pwd)" "$project_name"
+    
+    echo " Project '$project_name' created successfully!"
+    echo ""
+    echo "Created:"
+    echo "  - $project_name/"
+    echo "  - $project_name/.zota/"
+    echo "  - $project_name/.claude/commands/zota.md"
+    echo "  - $project_name/README.md"
+    echo ""
+    echo "To get started:"
+    echo "  cd $project_name"
+}
+
+# Main command handler
+case "$1" in
+    init)
+        init_project
+        ;;
+    new)
+        new_project "$2"
+        ;;
+    update)
+        update_zota "$2"
+        ;;
+    update-projects)
+        update_projects
+        ;;
+    list)
+        list_projects
+        ;;
+    --help|-h)
+        show_help
+        ;;
+    --version|-v)
+        get_version_info
+        ;;
+    "")
+        echo "Error: No command specified" >&2
+        echo ""
+        show_help
+        exit 1
+        ;;
+    *)
+        echo "Error: Unknown command '$1'" >&2
+        echo ""
+        show_help
+        exit 1
+        ;;
+esac

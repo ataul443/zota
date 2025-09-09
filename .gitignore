@@ -1,0 +1,12 @@
+# IDE files
+.idea
+.vscode
+
+# OS files
+.DS_Store
+
+# Logs
+logs
+# zota - exclude local context files
+context/local/**
+.zota/**
